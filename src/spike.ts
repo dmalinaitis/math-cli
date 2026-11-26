@@ -45,7 +45,7 @@ const c = {
   err: "\x1b[38;2;230;120;120m",
 };
 
-const caps = await queryTerminal();
+const caps = await queryTerminal({ needColors: true });
 const width = () => process.stdout.columns || caps.cols;
 const indent = 2;
 const emPx = (caps.cellH / 1.2) * arg("scale", 1.5); // font em ≈ cell height / line-height

@@ -14,6 +14,8 @@ import { isLocalModel, localModelId } from "./llm/types.js";
 import { AttachmentError, extractRefs, isAttachablePath, loadAttachment, unquotePath, type Attachment } from "./llm/attachments.js";
 import { prompt, promptRecord } from "./ui/input.js";
 import { StreamRenderer } from "./ui/markdown.js";
+import { clearRenderCache } from "./math/render.js";
+import { clearImagePlaceholders } from "./ui/text.js";
 import { applyTheme, theme as t, visibleLen } from "./ui/theme.js";
 
 const out = (s = "") => process.stdout.write(s + "\n");
@@ -345,7 +347,11 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
     case "clear": case "new":
       convo.reset();
       pending = [];
+      lastAnswer = "";
+      lastDisplayMath = [];
       transcript.length = 0;
+      clearRenderCache();
+      clearImagePlaceholders();
       process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
       banner();
       break;
