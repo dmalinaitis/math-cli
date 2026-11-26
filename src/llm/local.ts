@@ -1,13 +1,13 @@
 // Local models through LM Studio's OpenAI-compatible server (default http://localhost:1234).
-import { spawn, spawnSync } from "node:child_process";
+// The openai and unpdf packages are loaded on first use, so they cost nothing at startup.
+import { execFile, spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG_DIR } from "../config.js";
-import OpenAI from "openai";
+import type OpenAI from "openai";
 import type { ChatCompletionContentPart, ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { extractText } from "unpdf";
 import type { Attachment } from "./attachments.js";
 import { SYSTEM_PROMPT, localModelId, type Backend, type RunResult, type SendOptions, type Turn, type TurnCallbacks } from "./types.js";
 
@@ -19,24 +19,93 @@ export interface LocalModel {
 }
 
 export class LocalServerDown extends Error {}
+export class LocalAuthError extends Error {}
+export class LocalTimeout extends Error {}
 
-// LM Studio's native REST API reports type (llm / vlm), load state and context lengths.
-export async function listLocalModels(baseUrl: string): Promise<LocalModel[]> {
-  let res: Response;
+export const normalizeBaseUrl = (u: string) => u.trim().replace(/\/+$/, "");
+
+// Only ever start, stop or kill LM Studio when it runs on this machine (not a remote/Tailscale host).
+export function isLoopbackUrl(u: string): boolean {
   try {
-    res = await fetch(`${baseUrl}/api/v0/models`, { signal: AbortSignal.timeout(3000) });
+    const h = new URL(u).hostname.toLowerCase();
+    return h === "localhost" || h === "[::1]" || h === "::1" || /^127(\.\d{1,3}){3}$/.test(h);
   } catch {
-    throw new LocalServerDown(`LM Studio isn't reachable at ${baseUrl}`);
+    return false;
   }
-  const { data } = (await res.json()) as { data: any[] };
-  return data
-    .filter((m) => m.type === "llm" || m.type === "vlm")
-    .map((m) => ({
-      id: m.id,
-      vision: m.type === "vlm",
-      loaded: m.state === "loaded",
-      contextLength: m.loaded_context_length ?? m.max_context_length,
-    }));
+}
+
+const DEFAULT_CONTEXT = 32768;
+
+// LM Studio's native REST API reports type (llm / vlm), load state and context lengths. Tries the
+// 0.4+ API, then the legacy one, then the plain OpenAI-compatible list.
+export async function listLocalModels(baseUrl: string, timeoutMs = 2000): Promise<LocalModel[]> {
+  baseUrl = normalizeBaseUrl(baseUrl);
+  const headers: Record<string, string> = {};
+  if (process.env.LM_API_TOKEN) headers.Authorization = `Bearer ${process.env.LM_API_TOKEN}`;
+
+  // Parsed JSON body, or undefined for a non-2xx (e.g. 404 on an older LM Studio) or non-JSON reply.
+  let lastStatus = 0;
+  const get = async (path: string): Promise<any> => {
+    let res: Response;
+    try {
+      res = await fetch(`${baseUrl}${path}`, { headers, signal: AbortSignal.timeout(timeoutMs) });
+    } catch {
+      throw new LocalServerDown(`LM Studio isn't reachable at ${baseUrl}`);
+    }
+    lastStatus = res.status;
+    if (res.status === 401 || res.status === 403) {
+      throw new LocalAuthError(
+        `LM Studio at ${baseUrl} refused the request (HTTP ${res.status}) — set LM_API_TOKEN to its API token, or turn off authentication in LM Studio.`,
+      );
+    }
+    if (res.status >= 500) throw new LocalServerDown(`LM Studio at ${baseUrl} returned HTTP ${res.status}`);
+    if (!res.ok) return undefined;
+    return res.json().catch(() => undefined);
+  };
+
+  let answered = false; // some endpoint gave a valid (possibly empty) list
+
+  const v1 = await get("/api/v1/models");
+  if (Array.isArray(v1?.models)) {
+    answered = true;
+    const models: LocalModel[] = v1.models
+      .filter((m: any) => m.type === "llm" || m.type === "vlm")
+      .map((m: any) => ({
+        id: m.key ?? m.id,
+        vision: Boolean(m.capabilities?.vision || m.type === "vlm"),
+        loaded: Array.isArray(m.loaded_instances) && m.loaded_instances.length > 0,
+        contextLength: m.loaded_instances?.[0]?.config?.context_length ?? m.max_context_length ?? DEFAULT_CONTEXT,
+      }));
+    if (models.length) return models;
+  }
+
+  const v0 = await get("/api/v0/models");
+  if (Array.isArray(v0?.data)) {
+    answered = true;
+    const models: LocalModel[] = v0.data
+      .filter((m: any) => m.type === "llm" || m.type === "vlm")
+      .map((m: any) => ({
+        id: m.id,
+        vision: m.type === "vlm",
+        loaded: m.state === "loaded",
+        contextLength: m.loaded_context_length ?? m.max_context_length ?? DEFAULT_CONTEXT,
+      }));
+    if (models.length) return models;
+  }
+
+  const oai = await get("/v1/models");
+  if (Array.isArray(oai?.data)) {
+    return oai.data
+      .filter((m: any) => typeof m.id === "string" && !/embed/i.test(m.id))
+      .map((m: any) => ({
+        id: m.id,
+        vision: /vl|vision|qwen3\.5|gemma-?3|gemma-?4/i.test(m.id),
+        loaded: true,
+        contextLength: DEFAULT_CONTEXT,
+      }));
+  }
+  if (answered) return [];
+  throw new Error(`${baseUrl} doesn't look like an LM Studio server (HTTP ${lastStatus} from its models API)`);
 }
 
 const CLEANUP_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "lmstudio-cleanup.mjs");
@@ -46,14 +115,47 @@ const LMS = [join(homedir(), ".lmstudio", "bin", process.platform === "win32" ? 
   (p) => p === "lms" || existsSync(p),
 )!;
 
-export function startLocalServer(): boolean {
-  return spawnSync(LMS, ["server", "start"], { encoding: "utf8", timeout: 30000 }).status === 0;
+// Run `lms server start` without blocking the event loop (so the spinner and Ctrl+C keep working),
+// then wait briefly until the server actually answers.
+export async function startLocalServer(signal?: AbortSignal, baseUrl = "http://localhost:1234"): Promise<boolean> {
+  baseUrl = normalizeBaseUrl(baseUrl);
+  if (!isLoopbackUrl(baseUrl) || signal?.aborted) return false;
+  const started = await new Promise<boolean>((resolve) => {
+    let done = false;
+    const finish = (ok: boolean) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(ok);
+    };
+    const child = spawn(LMS, ["server", "start"], { stdio: "ignore", windowsHide: true });
+    const timer = setTimeout(() => { child.kill(); finish(false); }, 30000);
+    const onAbort = () => { child.kill(); finish(false); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    child.on("error", () => finish(false));
+    child.on("exit", (code) => finish(code === 0));
+  });
+  if (!started) return false;
+  for (let i = 0; i < 12 && !signal?.aborted; i++) {
+    try {
+      await fetch(`${baseUrl}/v1/models`, { signal: AbortSignal.timeout(250) });
+      return true; // any HTTP answer (even 401) means it's up
+    } catch {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+  return false;
 }
 
-function lmStudioAppRunning(): boolean {
-  if (process.platform !== "win32") return true; // unknown elsewhere: never quit it
-  const r = spawnSync("tasklist", ["/FI", "IMAGENAME eq LM Studio.exe", "/NH"], { encoding: "utf8" });
-  return r.stdout.includes("LM Studio.exe");
+// Whether the LM Studio app is running (Windows only; elsewhere unknown, so we never quit it).
+function lmStudioAppRunning(): Promise<boolean> {
+  if (process.platform !== "win32") return Promise.resolve(true);
+  return new Promise((resolve) => {
+    execFile("tasklist", ["/FI", "IMAGENAME eq LM Studio.exe", "/NH"], { encoding: "utf8", windowsHide: true, timeout: 3000 }, (err, stdout) => {
+      resolve(err ? true : (stdout ?? "").includes("LM Studio.exe"));
+    });
+  });
 }
 
 export type LocalOnExit = "auto" | "always" | "keep";
@@ -70,14 +172,16 @@ const pdfTextCache = new Map<string, string>();
 
 async function pdfText(path: string): Promise<string> {
   if (!pdfTextCache.has(path)) {
+    const { extractText } = await import("unpdf");
     const { text } = await extractText(new Uint8Array(readFileSync(path)), { mergePages: true });
     pdfTextCache.set(path, text);
   }
   return pdfTextCache.get(path)!;
 }
 
-// Splits <think>…</think> out of streamed content, tolerating tags split across chunks.
-class ThinkSplitter {
+// Splits <think>…</think> out of streamed content, tolerating tags split across chunks. A stray
+// </think> outside thinking (prompt templates that prefill <think>) is dropped rather than shown.
+export class ThinkSplitter {
   private inThink = false;
   private carry = "";
   constructor(private onText: (s: string) => void, private onThink: (s: string) => void) {}
@@ -85,16 +189,25 @@ class ThinkSplitter {
     s = this.carry + s;
     this.carry = "";
     while (s) {
-      const tag = this.inThink ? "</think>" : "<think>";
-      const i = s.indexOf(tag);
+      const tags = this.inThink ? ["</think>"] : ["<think>", "</think>"];
+      let i = -1, tag = "";
+      for (const tg of tags) {
+        const j = s.indexOf(tg);
+        if (j >= 0 && (i < 0 || j < i)) { i = j; tag = tg; }
+      }
       if (i >= 0) {
         this.emit(s.slice(0, i));
-        this.inThink = !this.inThink;
+        this.inThink = tag === "<think>";
         s = s.slice(i + tag.length);
         continue;
       }
       // Hold back a possible partial tag at the end.
-      const keep = [...Array(tag.length - 1).keys()].map((k) => k + 1).reverse().find((k) => tag.startsWith(s.slice(-k))) ?? 0;
+      let keep = 0;
+      for (const tg of tags) {
+        for (let k = Math.min(tg.length - 1, s.length); k > keep; k--) {
+          if (s.endsWith(tg.slice(0, k))) { keep = k; break; }
+        }
+      }
       this.emit(s.slice(0, s.length - keep));
       this.carry = s.slice(s.length - keep);
       s = "";
@@ -109,39 +222,67 @@ class ThinkSplitter {
   }
 }
 
+type OpenAISdk = typeof import("openai");
+let openaiLoading: Promise<OpenAISdk> | undefined;
+const loadOpenAI = () => (openaiLoading ??= import("openai"));
+
 export class LocalBackend implements Backend {
-  private client: OpenAI;
+  private client?: OpenAI;
   models: LocalModel[] = [];
 
+  private baseUrl: string;
   private before?: Before;
+  private appProbe?: Promise<boolean>;
   private used = new Set<string>(); // models this session sent messages to
   private startedServer = false;
 
-  constructor(private baseUrl: string) {
-    this.client = new OpenAI({ baseURL: `${baseUrl}/v1`, apiKey: "lm-studio" });
+  constructor(baseUrl: string) {
+    this.baseUrl = normalizeBaseUrl(baseUrl);
   }
 
-  async refresh(): Promise<LocalModel[]> {
-    this.before ??= { app: lmStudioAppRunning() };
-    this.models = await listLocalModels(this.baseUrl);
-    if (this.before.server === undefined) {
-      this.before.server = !this.startedServer;
-      this.before.loaded = new Set(this.models.filter((m) => m.loaded).map((m) => m.id));
+  get isLoopback() {
+    return isLoopbackUrl(this.baseUrl);
+  }
+
+  private async getClient(): Promise<OpenAI> {
+    if (!this.client) {
+      const { default: OpenAI } = await loadOpenAI();
+      // No retries: a refused connection should surface at once (we start the server and retry ourselves).
+      this.client = new OpenAI({ baseURL: `${this.baseUrl}/v1`, apiKey: process.env.LM_API_TOKEN || "lm-studio", maxRetries: 0 });
+    }
+    return this.client;
+  }
+
+  // Record whether the LM Studio app was already running before this session touched it.
+  private async snapshot(): Promise<Before> {
+    this.appProbe ??= this.isLoopback ? lmStudioAppRunning() : Promise.resolve(true);
+    const app = await this.appProbe;
+    return (this.before ??= { app });
+  }
+
+  async refresh(timeoutMs?: number): Promise<LocalModel[]> {
+    const before = await this.snapshot();
+    this.models = await listLocalModels(this.baseUrl, timeoutMs);
+    if (before.server === undefined) {
+      before.server = !this.startedServer;
+      before.loaded = new Set(this.models.filter((m) => m.loaded).map((m) => m.id));
     }
     return this.models;
   }
 
   // Start LM Studio's server (waking the app if needed); remembered so exit cleanup can stop it again.
-  startServer(): boolean {
-    this.before ??= { app: lmStudioAppRunning() };
-    const ok = startLocalServer();
+  // Never for a remote LM Studio: that isn't ours to start.
+  async startServer(signal?: AbortSignal): Promise<boolean> {
+    if (!this.isLoopback) return false;
+    await this.snapshot();
+    const ok = await startLocalServer(signal, this.baseUrl);
     if (ok) this.startedServer = true;
     return ok;
   }
 
   // Commands that undo what this session did in LM Studio (see LocalOnExit), or none.
   private cleanupCommands(mode: LocalOnExit): string[][] {
-    if (mode === "keep" || !this.before || (!this.used.size && !this.startedServer)) return [];
+    if (mode === "keep" || !this.isLoopback || !this.before || (!this.used.size && !this.startedServer)) return [];
     const always = mode === "always";
     const cmds: string[][] = [];
     if (always) cmds.push(["unload", "--all"]);
@@ -210,7 +351,8 @@ export class LocalBackend implements Backend {
     let finish: string | null = null;
 
     try {
-      const stream = await this.client.chat.completions.create(
+      const client = await this.getClient();
+      const stream = await client.chat.completions.create(
         { model: id, messages, stream: true, stream_options: { include_usage: true } },
         { signal: opts.signal },
       );
@@ -229,7 +371,12 @@ export class LocalBackend implements Backend {
       splitter.flush();
     } catch (e) {
       if (opts.signal.aborted) return { stopReason: null, servedBy: opts.model, aborted: true, costUsd: 0 };
-      if (e instanceof OpenAI.APIConnectionError) throw new LocalServerDown(`LM Studio isn't reachable at ${this.baseUrl}`);
+      const { APIConnectionError, APIConnectionTimeoutError } = await loadOpenAI();
+      // Check the timeout first: it's a subclass of APIConnectionError, but means "slow", not "down".
+      if (e instanceof APIConnectionTimeoutError) {
+        throw new LocalTimeout(`LM Studio at ${this.baseUrl} took too long to answer — the model may still be loading; try again in a moment.`);
+      }
+      if (e instanceof APIConnectionError) throw new LocalServerDown(`LM Studio isn't reachable at ${this.baseUrl}`);
       throw e;
     }
 

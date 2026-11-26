@@ -1,5 +1,5 @@
 // Math CLI — chat with Claude or a local model about maths, with LaTeX typeset in the terminal.
-import Anthropic from "@anthropic-ai/sdk";
+import { writeSync } from "node:fs";
 import { CONFIG_FILE, EFFORTS, INLINE_MODES, MODELS, loadConfig, resolveApiKey, saveConfig, type Effort, type InlineMode } from "./config.js";
 import { queryTerminal } from "./term/caps.js";
 import { writeClipboard } from "./term/clipboard.js";
@@ -7,8 +7,8 @@ import { bridgeStatus, clearTerminalTheme, enableBridge, inWezTerm, sendTerminal
 import { listThemes, resolveTheme } from "./ui/themes.js";
 import { onInput } from "./term/keys.js";
 import { termCols } from "./term/size.js";
-import { ClaudeBackend } from "./llm/claude.js";
-import { LOCAL_ON_EXIT, LocalBackend, LocalServerDown, type LocalOnExit } from "./llm/local.js";
+import { ClaudeBackend, classifyClaudeError } from "./llm/claude.js";
+import { LOCAL_ON_EXIT, LocalAuthError, LocalBackend, LocalServerDown, LocalTimeout, type LocalOnExit } from "./llm/local.js";
 import { Session } from "./llm/session.js";
 import { isLocalModel, localModelId } from "./llm/types.js";
 import { AttachmentError, extractRefs, isAttachablePath, loadAttachment, unquotePath, type Attachment } from "./llm/attachments.js";
@@ -19,7 +19,10 @@ import { applyTheme, theme as t, visibleLen } from "./ui/theme.js";
 const out = (s = "") => process.stdout.write(s + "\n");
 const note = (s: string) => out(`  ${t.dim}${s}${t.reset}`);
 const error = (s: string) => out(`  ${t.error}${s}${t.reset}`);
-process.on("exit", () => process.stdout.write("\x1b[?25h\x1b[?2004l"));
+// Synchronous: an async stdout write at exit can be dropped (notably on Windows).
+process.on("exit", () => {
+  try { writeSync(1, "\x1b[?25h\x1b[?2004l"); } catch { /* ignore */ }
+});
 
 let cfg = loadConfig();
 const caps = await queryTerminal();
@@ -137,18 +140,21 @@ function onPaste(text: string): boolean {
 
 // ---- API key -------------------------------------------------------------------------------------
 
-async function askForKey(reason: string): Promise<string> {
+// Undefined if the user skips (empty Enter) or cancels (Ctrl+C) — local models work without a key.
+async function askForKey(reason: string): Promise<string | undefined> {
   out();
   out(`  ${t.bold}${reason}${t.reset}`);
   note("Create a key at https://console.anthropic.com/settings/keys and paste it below.");
   note(`It is saved to ${CONFIG_FILE}. Alternatively set the ANTHROPIC_API_KEY environment variable.`);
   out();
   for (;;) {
-    const r = prompt({ mask: true, placeholder: "Paste your API key (Ctrl+V or Ctrl+Shift+V)", status: () => `${t.dim}Enter to save · Ctrl+C to quit${t.reset}` });
-    const res = await r;
-    if (res.kind === "exit") process.exit(0);
-    const key = res.text.trim();
-    if (!key) continue;
+    const res = await prompt({ mask: true, placeholder: "Paste your API key (Ctrl+V or Ctrl+Shift+V)", status: () => `${t.dim}Enter to save · Enter on empty to skip · Ctrl+C to cancel${t.reset}` });
+    const key = res.kind === "exit" ? "" : res.text.trim();
+    if (!key) {
+      note("No key saved — /key adds one later; /model local uses LM Studio instead.");
+      out();
+      return undefined;
+    }
     try {
       await ClaudeBackend.verifyKey(key, isLocalModel(cfg.model) ? MODELS.opus : cfg.model);
       cfg = saveConfig({ anthropicApiKey: key });
@@ -156,7 +162,8 @@ async function askForKey(reason: string): Promise<string> {
       out();
       return key;
     } catch (e) {
-      if (e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError) {
+      const kind = classifyClaudeError(e)?.kind;
+      if (kind === "auth" || kind === "permission") {
         error("That key was rejected by the API — check it and try again.");
         continue;
       }
@@ -207,13 +214,23 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
     }
     case "detach": pending = []; note("Attachments cleared."); break;
     case "model": case "m": {
+      const a = arg.toLowerCase();
+      // Claude models switch at once, without touching (or launching) LM Studio.
+      const claudeId = MODELS[a] ?? (a.startsWith("claude-") ? arg : undefined);
+      if (claudeId) {
+        cfg = saveConfig({ model: claudeId });
+        note(`Model: ${claudeId}${convo.turns.length ? " — the conversation so far carries over" : ""}`);
+        if (!convo.claude.hasKey) note("No Anthropic API key yet — add one with /key.");
+        break;
+      }
       const locals = await localModels(convo);
       if (!arg) {
         const mark = (id: string) => (id === cfg.model ? t.accent + "›" : " ");
         out(`  ${t.bold}Claude${t.reset}`);
         for (const [alias, id] of Object.entries(MODELS)) out(`  ${mark(id)} ${alias.padEnd(8)}${t.reset}${t.dim}${id}${t.reset}`);
         out(`  ${t.bold}Local (LM Studio)${t.reset}`);
-        if (!locals) note("  LM Studio isn't running — start it, or run: lms server start");
+        if (localError) note(`  ${localError}`);
+        else if (!locals) note("  LM Studio isn't running — start it, or run: lms server start");
         else if (!locals.length) note("  no models installed — download one in LM Studio");
         for (const m of locals ?? []) {
           const tags = [m.vision ? "vision" : "", `${tokens(m.contextLength)} ctx`, m.loaded ? "loaded" : ""].filter(Boolean).join(", ");
@@ -222,19 +239,18 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
         note("/model <name> — e.g. /model sonnet, /model local, /model gemma");
         break;
       }
-      const a = arg.toLowerCase();
-      let id = MODELS[a] ?? (a.startsWith("claude-") ? arg : undefined);
-      if (!id) {
-        const want = a === "local" ? cfg.localModel : a.replace(/^local:/, "");
-        const match = locals?.find((m) => m.id.toLowerCase() === want) ?? locals?.find((m) => m.id.toLowerCase().includes(want));
-        if (match) id = `local:${match.id}`;
-        else if (!locals) { error("LM Studio isn't running — start it, or run: lms server start"); break; }
+      const want = (a === "local" ? cfg.localModel : a.replace(/^local:/, "")).toLowerCase();
+      const match = locals?.find((m) => m.id.toLowerCase() === want) ?? locals?.find((m) => m.id.toLowerCase().includes(want));
+      if (!match) {
+        if (localError) error(localError);
+        else if (!locals) error("LM Studio isn't running — start it, or run: lms server start");
+        else error(`unknown model "${arg}" — /model lists them`);
+        break;
       }
-      if (!id) { error(`unknown model "${arg}" — /model lists them`); break; }
-      cfg = saveConfig(isLocalModel(id) ? { model: id, localModel: localModelId(id) } : { model: id });
+      const id = `local:${match.id}`;
+      cfg = saveConfig({ model: id, localModel: match.id });
       note(`Model: ${id}${convo.turns.length ? " — the conversation so far carries over" : ""}`);
-      if (isLocalModel(id) && !locals?.find((m) => `local:${m.id}` === id)?.loaded) note("It will load on the first message (a few seconds).");
-      if (!isLocalModel(id) && !convo.claude.hasKey) note("No Anthropic API key yet — add one with /key.");
+      if (!match.loaded) note("It will load on the first message (a few seconds).");
       break;
     }
     case "effort": case "e": {
@@ -334,7 +350,8 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
       banner();
       break;
     case "key": {
-      convo.claude.setApiKey(await askForKey("Enter a new Anthropic API key."));
+      const key = await askForKey("Enter a new Anthropic API key.");
+      if (key) convo.claude.setApiKey(key);
       break;
     }
     case "exit": case "quit": case "q":
@@ -346,17 +363,30 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
 
 // ---- a turn --------------------------------------------------------------------------------------
 
-// LM Studio's models, starting its server if needed; undefined if it can't be reached.
+// LM Studio's models, starting its server if needed (local installs only); undefined if it can't be
+// reached. A reason worth showing (auth, not LM Studio) is left in localError.
+let localError: string | undefined;
 async function localModels(convo: Session) {
+  localError = undefined;
   try {
     return await convo.local.refresh();
   } catch (e) {
-    if (!(e instanceof LocalServerDown) || !convo.local.startServer()) return undefined;
+    if (!(e instanceof LocalServerDown)) {
+      localError = e instanceof Error ? e.message : String(e);
+      return undefined;
+    }
+    if (!(await convo.local.startServer())) return undefined;
     return convo.local.refresh().catch(() => undefined);
   }
 }
 
 async function ask(convo: Session, input: string) {
+  // First Claude message without a key: ask now (skipping keeps the question unsent).
+  if (!isLocalModel(cfg.model) && !convo.claude.hasKey) {
+    const key = await askForKey("Claude needs an Anthropic API key.");
+    if (!key) return;
+    convo.claude.setApiKey(key);
+  }
   const { text, refs } = extractRefs(input);
   if (refs.length && !attach(refs)) return;
   const files = pending;
@@ -422,10 +452,16 @@ async function ask(convo: Session, input: string) {
     try {
       r = await send();
     } catch (e) {
-      // LM Studio's server isn't running: start it once and retry.
-      if (!(e instanceof LocalServerDown) || !convo.local.startServer()) throw e;
+      // LM Studio's server isn't running: start it once (on this machine only) and retry.
+      if (!(e instanceof LocalServerDown) || !convo.local.isLoopback || ctl.signal.aborted) throw e;
       label = "starting LM Studio";
-      r = await send();
+      const up = await convo.local.startServer(ctl.signal);
+      if (ctl.signal.aborted) r = { stopReason: null, servedBy: cfg.model, aborted: true, costUsd: 0 };
+      else if (!up) throw e;
+      else {
+        label = "running locally";
+        r = await send();
+      }
     }
     stopSpinner();
     flushThinking();
@@ -439,12 +475,14 @@ async function ask(convo: Session, input: string) {
     stopSpinner();
     renderer.end();
     pending = files; // keep attachments so the user can retry
-    if (e instanceof Anthropic.AuthenticationError) tellError("The API key was rejected — use /key to set a new one.");
-    else if (e instanceof Anthropic.RateLimitError) tellError("Rate limited — wait a moment and try again.");
-    else if (e instanceof Anthropic.BadRequestError) tellError(`Request rejected: ${e.message}`);
-    else if (e instanceof Anthropic.APIConnectionError) tellError("Couldn't reach the Anthropic API — check your connection.");
-    else if (e instanceof Anthropic.APIError) tellError(`API error ${e.status}: ${e.message}`);
+    const c = classifyClaudeError(e);
+    if (c?.kind === "auth") tellError("The API key was rejected — use /key to set a new one.");
+    else if (c?.kind === "rate-limit") tellError("Rate limited — wait a moment and try again.");
+    else if (c?.kind === "bad-request") tellError(`Request rejected: ${c.message}`);
+    else if (c?.kind === "connection") tellError("Couldn't reach the Anthropic API — check your connection.");
+    else if (c) tellError(`API error ${c.status}: ${c.message}`);
     else if (e instanceof LocalServerDown) tellError(`${e.message} — open LM Studio or run: lms server start`);
+    else if (e instanceof LocalAuthError || e instanceof LocalTimeout) tellError(e.message);
     else tellError(e instanceof Error ? e.message : String(e));
   } finally {
     turn.answer = answer;
@@ -479,7 +517,8 @@ if (process.env.MATHCLI_AUTOASK) {
 const convo = new Session(new ClaudeBackend(key), new LocalBackend(cfg.lmstudioUrl));
 // On exit (including the window being closed): unload local models / stop LM Studio per /local-exit.
 process.on("exit", () => convo.local.cleanupOnExit(cfg.localOnExit));
-if (isLocalModel(cfg.model)) await localModels(convo); // context size for the meter
+// Context size for the meter: a quick passive look in the background — never blocks the prompt, never starts LM Studio.
+if (isLocalModel(cfg.model)) convo.local.refresh(800).catch(() => {});
 
 for (;;) {
   const r = await prompt({

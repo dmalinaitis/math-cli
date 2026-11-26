@@ -1,5 +1,5 @@
 // Claude backend: streaming, attachments, adaptive thinking, refusal fallback, cost and context tracking.
-import Anthropic from "@anthropic-ai/sdk";
+import type Anthropic from "@anthropic-ai/sdk";
 import { SYSTEM_PROMPT, type Backend, type RunResult, type SendOptions, type Turn, type TurnCallbacks } from "./types.js";
 
 const PRICES: Record<string, { in: number; out: number; cacheRead: number }> = {
@@ -22,25 +22,62 @@ function toMessages(turns: Turn[]): Anthropic.Beta.BetaMessageParam[] {
   return messages;
 }
 
+// The SDK is loaded on first use, so startup (and local-only sessions) never pay for it.
+type AnthropicSdk = typeof import("@anthropic-ai/sdk");
+let sdk: AnthropicSdk | undefined;
+let sdkLoading: Promise<AnthropicSdk> | undefined;
+export async function getAnthropic(): Promise<AnthropicSdk["default"]> {
+  sdkLoading ??= import("@anthropic-ai/sdk").then((m) => (sdk = m));
+  return (await sdkLoading).default;
+}
+
+export type ClaudeErrorKind = "auth" | "permission" | "rate-limit" | "bad-request" | "connection" | "api";
+
+// Classify an error thrown by the Anthropic SDK, without the caller importing it. Undefined if it
+// isn't an SDK error (if the SDK was never loaded, nothing can have come from it).
+export function classifyClaudeError(e: unknown): { kind: ClaudeErrorKind; status?: number; message: string } | undefined {
+  const A = sdk?.default;
+  if (!A || !(e instanceof A.APIError)) return undefined;
+  const kind: ClaudeErrorKind =
+    e instanceof A.AuthenticationError ? "auth"
+    : e instanceof A.PermissionDeniedError ? "permission"
+    : e instanceof A.RateLimitError ? "rate-limit"
+    : e instanceof A.BadRequestError ? "bad-request"
+    : e instanceof A.APIConnectionError ? "connection"
+    : "api";
+  return { kind, status: e.status, message: e.message };
+}
+
 export class ClaudeBackend implements Backend {
   private client?: Anthropic;
+  private apiKey?: string;
 
   constructor(apiKey?: string) {
-    if (apiKey) this.client = new Anthropic({ apiKey });
+    this.apiKey = apiKey || undefined;
   }
 
   setApiKey(apiKey: string) {
-    this.client = new Anthropic({ apiKey });
+    this.apiKey = apiKey;
+    this.client = undefined;
   }
 
   get hasKey() {
-    return !!this.client;
+    return !!this.apiKey;
+  }
+
+  private async getClient(): Promise<Anthropic> {
+    if (!this.apiKey) throw new Error("No Anthropic API key — use /key to add one, or /model local for a local model.");
+    if (!this.client) {
+      const A = await getAnthropic();
+      this.client = new A({ apiKey: this.apiKey });
+    }
+    return this.client;
   }
 
   async run(turns: Turn[], opts: SendOptions, cb: TurnCallbacks): Promise<RunResult> {
-    if (!this.client) throw new Error("No Anthropic API key — use /key to add one, or /model local for a local model.");
+    const client = await this.getClient();
     const isHaiku = opts.model.startsWith("claude-haiku");
-    const stream = this.client.beta.messages.stream(
+    const stream = client.beta.messages.stream(
       {
         model: opts.model,
         max_tokens: 64000,
@@ -89,7 +126,7 @@ export class ClaudeBackend implements Backend {
       const text = msg.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
       return { ...base, stopReason: msg.stop_reason, reply: { text, model: msg.model, claudeContent: msg.content } };
     } catch (e) {
-      if (e instanceof Anthropic.APIUserAbortError || opts.signal.aborted) {
+      if (e instanceof (await getAnthropic()).APIUserAbortError || opts.signal.aborted) {
         return { stopReason: null, servedBy: opts.model, aborted: true, costUsd: 0 };
       }
       throw e;
@@ -98,6 +135,7 @@ export class ClaudeBackend implements Backend {
 
   // Cheap auth check: fetch the model's metadata.
   static async verifyKey(apiKey: string, model: string): Promise<void> {
-    await new Anthropic({ apiKey }).models.retrieve(model);
+    const A = await getAnthropic();
+    await new A({ apiKey }).models.retrieve(model);
   }
 }
