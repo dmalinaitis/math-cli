@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { ClaudeBackend, claudeContextWindow } from "./claude.js";
 import { LocalBackend } from "./local.js";
 import type { Attachment } from "./attachments.js";
+import { stripControls } from "../ui/text.js";
 import { isLocalModel, type RunResult, type SendOptions, type Turn, type TurnCallbacks } from "./types.js";
 
 export class Session {
@@ -24,7 +25,18 @@ export class Session {
     return this.local.models.find((m) => `local:${m.id}` === model)?.contextLength;
   }
 
-  async send(text: string, attachments: Attachment[], opts: SendOptions, cb: TurnCallbacks): Promise<RunResult> {
+  async send(text: string, attachments: Attachment[], opts: SendOptions, raw: TurnCallbacks): Promise<RunResult> {
+    // Backends relay text from models and servers we don't control: strip terminal control characters
+    // before any of it reaches the screen, the transcript or the clipboard (/copy).
+    const cb: TurnCallbacks = {
+      onThinkingStart: raw.onThinkingStart,
+      onThinking: raw.onThinking && ((d) => raw.onThinking!(stripControls(d))),
+      onText: (d) => {
+        d = stripControls(d);
+        if (d) raw.onText(d);
+      },
+      onNotice: raw.onNotice && ((n) => raw.onNotice!(stripControls(n))),
+    };
     const turn: Turn = { text, attachments };
     this.turns.push(turn);
     try {

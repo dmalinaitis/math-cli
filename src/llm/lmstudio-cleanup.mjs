@@ -3,9 +3,11 @@
 // It runs as its own process so it survives the terminal window closing.
 import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 const [lms, log, json] = process.argv.slice(2);
+// Full paths: on Windows a bare name is looked up in the current directory first.
+const sys32 = (exe) => join(process.env.SystemRoot ?? "C:\\Windows", "System32", exe);
 try { mkdirSync(dirname(log), { recursive: true }); } catch { /* ignore */ }
 const say = (s) => {
   try { appendFileSync(log, `${new Date().toISOString()} ${s}\n`); } catch { /* ignore */ }
@@ -15,10 +17,10 @@ for (const cmd of JSON.parse(json)) {
   if (cmd[0] === "quit-app") {
     // Ask politely first (lets LM Studio save its state/index), then force it.
     const kill = (force) =>
-      spawnSync("taskkill", ["/IM", "LM Studio.exe", "/T", ...(force ? ["/F"] : [])], { encoding: "utf8", windowsHide: true, timeout: 15000 });
+      spawnSync(sys32("taskkill.exe"), ["/IM", "LM Studio.exe", "/T", ...(force ? ["/F"] : [])], { encoding: "utf8", windowsHide: true, timeout: 15000 });
     let r = { status: 0, stdout: "skipped (not Windows)" };
     const running = () =>
-      (spawnSync("tasklist", ["/FI", "IMAGENAME eq LM Studio.exe", "/NH"], { encoding: "utf8", windowsHide: true, timeout: 3000 }).stdout ?? "")
+      (spawnSync(sys32("tasklist.exe"), ["/FI", "IMAGENAME eq LM Studio.exe", "/NH"], { encoding: "utf8", windowsHide: true, timeout: 3000 }).stdout ?? "")
         .includes("LM Studio.exe");
     if (process.platform === "win32") {
       r = kill(false);

@@ -16,12 +16,13 @@ import { prompt, promptRecord, type SlashCommand } from "./ui/input.js";
 import { select, type SelectEntry } from "./ui/select.js";
 import { StreamRenderer } from "./ui/markdown.js";
 import { clearRenderCache } from "./math/render.js";
-import { clearImagePlaceholders } from "./ui/text.js";
+import { clearImagePlaceholders, stripControls } from "./ui/text.js";
 import { applyTheme, theme as t, visibleLen } from "./ui/theme.js";
 
 const out = (s = "") => process.stdout.write(s + "\n");
-const note = (s: string) => out(`  ${t.dim}${s}${t.reset}`);
-const error = (s: string) => out(`  ${t.error}${s}${t.reset}`);
+// Notes and errors often carry outside text (API/LM Studio errors, filenames, model ids): never print its control characters.
+const note = (s: string) => out(`  ${t.dim}${stripControls(s)}${t.reset}`);
+const error = (s: string) => out(`  ${t.error}${stripControls(s)}${t.reset}`);
 // Synchronous: an async stdout write at exit can be dropped (notably on Windows).
 process.on("exit", () => {
   try { writeSync(1, "\x1b[?25h\x1b[?2004l"); } catch { /* ignore */ }
@@ -108,7 +109,7 @@ function status(convo?: Session): string {
 
 function attachmentChips(): string[] {
   if (!pending.length) return [];
-  const chips = pending.map((a) => `${t.attach}⎘ ${a.name}${t.reset}${t.dim} ${(a.bytes / 1024).toFixed(0)} KB${t.reset}`);
+  const chips = pending.map((a) => `${t.attach}⎘ ${stripControls(a.name)}${t.reset}${t.dim} ${(a.bytes / 1024).toFixed(0)} KB${t.reset}`);
   return [`  ${chips.join("   ")}   ${t.dim}(/detach to remove)${t.reset}`];
 }
 

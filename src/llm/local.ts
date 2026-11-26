@@ -3,12 +3,13 @@
 import { execFile, spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG_DIR } from "../config.js";
 import type OpenAI from "openai";
 import type { ChatCompletionContentPart, ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { Attachment } from "./attachments.js";
+import { stripControls } from "../ui/text.js";
 import { SYSTEM_PROMPT, localModelId, type Backend, type RunResult, type SendOptions, type Turn, type TurnCallbacks } from "./types.js";
 
 export interface LocalModel {
@@ -71,7 +72,7 @@ export async function listLocalModels(baseUrl: string, timeoutMs = 2000): Promis
     const models: LocalModel[] = v1.models
       .filter((m: any) => m.type === "llm" || m.type === "vlm")
       .map((m: any) => ({
-        id: m.key ?? m.id,
+        id: stripControls(String(m.key ?? m.id)), // shown in /model and the status line
         vision: Boolean(m.capabilities?.vision || m.type === "vlm"),
         loaded: Array.isArray(m.loaded_instances) && m.loaded_instances.length > 0,
         contextLength: m.loaded_instances?.[0]?.config?.context_length ?? m.max_context_length ?? DEFAULT_CONTEXT,
@@ -85,7 +86,7 @@ export async function listLocalModels(baseUrl: string, timeoutMs = 2000): Promis
     const models: LocalModel[] = v0.data
       .filter((m: any) => m.type === "llm" || m.type === "vlm")
       .map((m: any) => ({
-        id: m.id,
+        id: stripControls(String(m.id)),
         vision: m.type === "vlm",
         loaded: m.state === "loaded",
         contextLength: m.loaded_context_length ?? m.max_context_length ?? DEFAULT_CONTEXT,
@@ -98,7 +99,7 @@ export async function listLocalModels(baseUrl: string, timeoutMs = 2000): Promis
     return oai.data
       .filter((m: any) => typeof m.id === "string" && !/embed/i.test(m.id))
       .map((m: any) => ({
-        id: m.id,
+        id: stripControls(m.id),
         vision: /vl|vision|qwen3\.5|gemma-?3|gemma-?4/i.test(m.id),
         loaded: true,
         contextLength: DEFAULT_CONTEXT,
@@ -110,10 +111,21 @@ export async function listLocalModels(baseUrl: string, timeoutMs = 2000): Promis
 
 const CLEANUP_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "lmstudio-cleanup.mjs");
 
-// LM Studio's CLI, installed alongside the app.
-const LMS = [join(homedir(), ".lmstudio", "bin", process.platform === "win32" ? "lms.exe" : "lms"), "lms"].find(
-  (p) => p === "lms" || existsSync(p),
-)!;
+// LM Studio's CLI, installed alongside the app, else found on PATH. Always a full path: on Windows a
+// bare name is looked up in the current directory first, so a planted lms.exe there would run.
+export function findLms(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
+  const exe = process.platform === "win32" ? "lms.exe" : "lms";
+  const bundled = join(home, ".lmstudio", "bin", exe);
+  if (existsSync(bundled)) return bundled;
+  for (const dir of (env.PATH ?? env.Path ?? "").split(delimiter)) {
+    if (isAbsolute(dir) && existsSync(join(dir, exe))) return join(dir, exe);
+  }
+  return bundled; // not installed: spawning it fails cleanly
+}
+const LMS = findLms();
+
+// Full path, for the same reason.
+const TASKLIST = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tasklist.exe");
 
 // Run `lms server start` without blocking the event loop (so the spinner and Ctrl+C keep working),
 // then wait briefly until the server actually answers.
@@ -152,7 +164,7 @@ export async function startLocalServer(signal?: AbortSignal, baseUrl = "http://l
 function lmStudioAppRunning(): Promise<boolean> {
   if (process.platform !== "win32") return Promise.resolve(true);
   return new Promise((resolve) => {
-    execFile("tasklist", ["/FI", "IMAGENAME eq LM Studio.exe", "/NH"], { encoding: "utf8", windowsHide: true, timeout: 3000 }, (err, stdout) => {
+    execFile(TASKLIST, ["/FI", "IMAGENAME eq LM Studio.exe", "/NH"], { encoding: "utf8", windowsHide: true, timeout: 3000 }, (err, stdout) => {
       resolve(err ? true : (stdout ?? "").includes("LM Studio.exe"));
     });
   });
