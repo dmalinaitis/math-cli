@@ -17,8 +17,11 @@ const clipDir = () => {
   return dir;
 };
 
+// Full path: Windows looks for a bare "powershell.exe" in the current directory before PATH.
+const POWERSHELL = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+
 const ps = (script: string) =>
-  spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Sta", "-Command", script], { encoding: "utf8", timeout: 5000 });
+  spawnSync(POWERSHELL, ["-NoProfile", "-NonInteractive", "-Sta", "-Command", script], { encoding: "utf8", timeout: 5000 });
 
 export function readClipboard(): ClipboardContent {
   if (process.platform === "win32") {

@@ -109,6 +109,14 @@ test("listLocalModels: falls back to OpenAI-compatible /v1/models", async () => 
   ]);
 });
 
+test("listLocalModels: strips control characters from model ids", async () => {
+  handler = (req, res) => {
+    if (req.url !== "/api/v1/models") return res.writeHead(404).end();
+    json(res, { models: [{ type: "llm", key: "evil\x1b]52;c;eA==\x07-model" }] });
+  };
+  assert.deepEqual((await listLocalModels(base)).map((m) => m.id), ["evil]52;c;eA==-model"]);
+});
+
 test("listLocalModels: sends LM_API_TOKEN as a bearer token", async () => {
   let auth: string | undefined;
   handler = (req, res) => { auth = req.headers.authorization; json(res, { models: [] }); };

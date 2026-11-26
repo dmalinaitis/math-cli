@@ -18,9 +18,16 @@ export function placeholder(esc: string, cols: number): string {
   return OPEN + id + CLOSE;
 }
 
+// Text from outside the app (model output, LM Studio model ids and errors, filenames) must reach the
+// terminal without control characters: ESC/C1 sequences could set the clipboard (OSC 52), add hidden
+// links (OSC 8), retitle the window, move the cursor to fake output, or theme the window through the
+// WezTerm bridge. The placeholder delimiters (OPEN/CLOSE) go too, so text can't forge an inline image.
+// Keeps \t and \n.
+export const stripControls = (s: string): string => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+
 // Visible width: strip ANSI, ignore combining marks (x̂, v⃗), count code points; placeholders count as their image width.
 export function visibleLen(s: string): number {
-  s = s.replace(PLACEHOLDER, (_m, id) => "x".repeat(images[Number(id)].cols));
+  s = s.replace(PLACEHOLDER, (_m, id) => "x".repeat(images[Number(id)]?.cols ?? 0));
   return [...s.replace(/\x1b\[[\d;]*m/g, "").replace(/\p{M}/gu, "")].length;
 }
 
@@ -29,6 +36,7 @@ export function visibleLen(s: string): number {
 export function expandLine(line: string): string {
   return line.replace(PLACEHOLDER, (_m, id, offset: number) => {
     const img = images[Number(id)];
+    if (!img) return ""; // stale or forged id
     const col = visibleLen(line.slice(0, offset)); // 0-based column where the image starts
     return `${img.esc}\x1b[${col + img.cols + 1}G`;
   });

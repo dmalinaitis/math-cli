@@ -51,8 +51,9 @@ npm link        # optional: adds a global `mathcli` command
    powershell -ExecutionPolicy Bypass -File scripts\update-wezterm-conpty.ps1
    ```
 
-   It downloads Microsoft's current ConPTY from nuget.org and swaps two files in
-   `C:\Program Files\WezTerm` (originals kept as `*.bak`). **Re-run it after reinstalling or upgrading WezTerm.**
+   It downloads Microsoft's current ConPTY from nuget.org, checks the package against a pinned SHA-512
+   and both files for a valid Microsoft signature, then swaps them into `C:\Program Files\WezTerm`
+   (originals kept as `*.bak`). **Re-run it after reinstalling or upgrading WezTerm.**
 3. **Let Math CLI theme its window (optional).** Run `/setup-terminal` inside `mathcli` once. It adds one
    line to your `.wezterm.lua` (backup saved as `.wezterm.lua.bak`) so the app can set that window's
    background, transparency and blur while it runs. Other WezTerm windows are unaffected.
