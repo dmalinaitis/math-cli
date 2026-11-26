@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "description": "A maths chat for the terminal that renders LaTeX as real typeset equations — Claude or local models via LM Studio",
   "scripts": {
-    "start": "tsx src/cli.ts",
+    "build": "tsc && node -e \"import('node:fs').then(fs => fs.copyFileSync('src/llm/lmstudio-cleanup.mjs', 'dist/llm/lmstudio-cleanup.mjs'))\"",
+    "prepare": "npm run build",
+    "start": "node bin/mathcli.mjs",
+    "dev": "tsx src/cli.ts",
     "test": "tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "spike": "tsx src/spike.ts",
@@ -26,11 +29,11 @@
     "@resvg/resvg-js": "^2.6.2",
     "mathjax-full": "^3.2.1",
     "openai": "^7.27.0",
-    "tsx": "^4.23.15",
     "unpdf": "^1.8.1"
   },
   "devDependencies": {
     "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   },
   "type": "module",

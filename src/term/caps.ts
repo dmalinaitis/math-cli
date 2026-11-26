@@ -32,26 +32,35 @@ function detectGraphics(): GraphicsProtocol {
   return "none";
 }
 
-function queryEscapes(timeoutMs: number): Promise<string> {
+function queryEscapes(timeoutMs: number, needColors: boolean): Promise<string> {
   return new Promise((resolve) => {
     let buf = "";
+    let finished = false;
+    let colorTimer: NodeJS.Timeout | undefined;
     const done = () => {
+      if (finished) return;
+      finished = true;
       clearTimeout(timer);
+      clearTimeout(colorTimer);
       stop();
       resolve(buf);
     };
     const onData = (d: Buffer) => {
       buf += d.toString("latin1");
-      const haveSize = /\x1b\[6;\d+;\d+t/.test(buf);
-      const haveColours = /\x1b\]11;[^\x07\x1b]*/.test(buf);
-      if (haveSize && haveColours) done();
-      else if (haveSize) setTimeout(done, 60); // give colour replies a moment, if the terminal sends them
+      const haveSize = /\x1b\[6;\d+;\d+t/.test(buf) || /\x1b\[4;\d+;\d+t/.test(buf);
+      if (!haveSize) return;
+      if (!needColors) return done();
+      if (/\x1b\]11;[^\x07\x1b]*/.test(buf)) return done();
+      // Give colour replies a moment, if the terminal sends them (ConPTY swallows OSC 10/11).
+      colorTimer ??= setTimeout(done, 60);
     };
     const timer = setTimeout(done, timeoutMs);
     const stop = onInput(onData);
-    process.stdout.write("\x1b[16t\x1b[14t\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+    process.stdout.write("\x1b[16t\x1b[14t" + (needColors ? "\x1b]10;?\x1b\\\x1b]11;?\x1b\\" : ""));
   });
 }
+
+const positive = (n: number) => Number.isFinite(n) && n > 0;
 
 // WezTerm can report the pane's pixel size over its CLI even when escapes are filtered.
 function weztermCellSize(): { w: number; h: number } | undefined {
@@ -60,15 +69,25 @@ function weztermCellSize(): { w: number; h: number } | undefined {
   if (pane === undefined || !gui) return;
   try {
     const exe = gui.replace(/wezterm-gui(\.exe)?$/i, (_m, ext) => `wezterm${ext ?? ""}`);
-    const panes = JSON.parse(execFileSync(exe, ["cli", "list", "--format", "json"], { timeout: 1500 }).toString());
+    const out = execFileSync(exe, ["cli", "list", "--format", "json"], { timeout: 500, windowsHide: true });
+    const panes = JSON.parse(out.toString());
     const s = panes.find((p: any) => String(p.pane_id) === pane)?.size;
-    if (s?.pixel_width && s.cols) return { w: s.pixel_width / s.cols, h: s.pixel_height / s.rows };
+    if (!s?.cols || !s.rows) return;
+    const w = s.pixel_width / s.cols;
+    const h = s.pixel_height / s.rows;
+    if (positive(w) && positive(h)) return { w, h };
   } catch {
     return;
   }
 }
 
-export async function queryTerminal(timeoutMs = 1000): Promise<TermCaps> {
+export interface QueryOptions {
+  timeoutMs?: number;
+  needColors?: boolean; // also ask for OSC 10/11 fg/bg colours (slower on terminals that drop them)
+}
+
+export async function queryTerminal(opts: number | QueryOptions = {}): Promise<TermCaps> {
+  const { timeoutMs = 350, needColors = false } = typeof opts === "number" ? { timeoutMs: opts } : opts;
   const env = process.env;
   const caps: TermCaps = {
     cellW: 9,
@@ -79,25 +98,32 @@ export async function queryTerminal(timeoutMs = 1000): Promise<TermCaps> {
     graphics: detectGraphics(),
     measured: false,
   };
-  if (env.MATHCLI_CELL_W && env.MATHCLI_CELL_H) {
-    caps.cellW = Number(env.MATHCLI_CELL_W);
-    caps.cellH = Number(env.MATHCLI_CELL_H);
+  const envW = Number(env.MATHCLI_CELL_W);
+  const envH = Number(env.MATHCLI_CELL_H);
+  if (env.MATHCLI_CELL_W && env.MATHCLI_CELL_H && positive(envW) && positive(envH)) {
+    caps.cellW = envW;
+    caps.cellH = envH;
     caps.measured = "env";
+    if (!needColors) return caps; // nothing left to ask the terminal
   }
   const { stdin, stdout } = process;
   if (!stdin.isTTY || !stdout.isTTY) return caps;
 
-  const reply = await queryEscapes(timeoutMs);
+  const reply = await queryEscapes(timeoutMs, needColors);
   const cell = /\x1b\[6;(\d+);(\d+)t/.exec(reply);
   const area = /\x1b\[4;(\d+);(\d+)t/.exec(reply);
-  if (!caps.measured && cell) {
+  if (!caps.measured && cell && positive(Number(cell[1])) && positive(Number(cell[2]))) {
     caps.cellH = Number(cell[1]);
     caps.cellW = Number(cell[2]);
     caps.measured = "escape";
   } else if (!caps.measured && area && stdout.rows && stdout.columns) {
-    caps.cellH = Number(area[1]) / stdout.rows;
-    caps.cellW = Number(area[2]) / stdout.columns;
-    caps.measured = "escape";
+    const h = Number(area[1]) / stdout.rows;
+    const w = Number(area[2]) / stdout.columns;
+    if (positive(w) && positive(h)) {
+      caps.cellH = h;
+      caps.cellW = w;
+      caps.measured = "escape";
+    }
   }
   if (!caps.measured) {
     const wz = weztermCellSize();
@@ -107,9 +133,11 @@ export async function queryTerminal(timeoutMs = 1000): Promise<TermCaps> {
       caps.measured = "wezterm-cli";
     }
   }
-  const fg = /\x1b\]10;([^\x07\x1b]*)/.exec(reply);
-  const bg = /\x1b\]11;([^\x07\x1b]*)/.exec(reply);
-  caps.fg = (fg && rgbFromOsc(fg[1])) || caps.fg;
-  caps.bg = (bg && rgbFromOsc(bg[1])) || caps.bg;
+  if (needColors) {
+    const fg = /\x1b\]10;([^\x07\x1b]*)/.exec(reply);
+    const bg = /\x1b\]11;([^\x07\x1b]*)/.exec(reply);
+    caps.fg = (fg && rgbFromOsc(fg[1])) || caps.fg;
+    caps.bg = (bg && rgbFromOsc(bg[1])) || caps.bg;
+  }
   return caps;
 }
