@@ -12,7 +12,8 @@ import { LOCAL_ON_EXIT, LocalAuthError, LocalBackend, LocalServerDown, LocalTime
 import { Session } from "./llm/session.js";
 import { isLocalModel, localModelId } from "./llm/types.js";
 import { AttachmentError, extractRefs, isAttachablePath, loadAttachment, unquotePath, type Attachment } from "./llm/attachments.js";
-import { prompt, promptRecord } from "./ui/input.js";
+import { prompt, promptRecord, type SlashCommand } from "./ui/input.js";
+import { select, type SelectEntry } from "./ui/select.js";
 import { StreamRenderer } from "./ui/markdown.js";
 import { clearRenderCache } from "./math/render.js";
 import { clearImagePlaceholders } from "./ui/text.js";
@@ -179,34 +180,74 @@ async function askForKey(reason: string): Promise<string | undefined> {
 
 // ---- commands ------------------------------------------------------------------------------------
 
-const HELP: [string, string][] = [
-  ["/attach <file…>", "attach images, PDFs or .tex/.txt files (or type @file, or drag files onto the window)"],
-  ["/detach", "remove pending attachments"],
-  ["/model [name]", "list or switch models: opus, sonnet, fable, haiku, local, or an LM Studio model (e.g. gemma)"],
-  ["/effort [low…max]", "how hard Claude thinks (default high)"],
-  ["/thinking", "toggle showing Claude's summarised reasoning"],
-  ["/scale <n>", "display-math size relative to text (default 1.5)"],
-  ["/inline [auto|image|unicode]", "inline maths: typeset only when Unicode can't show it exactly (auto), always, or never"],
-  ["/theme [name]", "list or switch themes (royal, white, midnight, mocha, or your own in ~/.mathcli/themes)"],
-  ["/opacity [0.3–1]", "window transparency in WezTerm (1 = opaque)"],
-  ["/blur [on|off]", "acrylic blur behind a translucent window"],
-  ["/setup-terminal", "let mathcli theme its WezTerm window (adds one line to your .wezterm.lua)"],
-  ["/local-exit [auto|always|keep]", "on exit, free the local model and close LM Studio (auto: only what mathcli started)"],
-  ["/copy", "copy the last answer (markdown + LaTeX) to the clipboard"],
-  ["/copy-latex", "copy just the display equations from the last answer"],
-  ["/redraw", "re-render the conversation (e.g. after resizing the window)"],
-  ["/clear", "start a new conversation"],
-  ["/key", "replace the saved API key"],
-  ["/exit", "quit (or Ctrl+C on an empty prompt)"],
+const COMMANDS: SlashCommand[] = [
+  { name: "/model", usage: "[name]", description: "switch Claude or LM Studio model (arrows, ←/→ effort)" },
+  { name: "/theme", usage: "[name]", description: "switch theme with live preview" },
+  { name: "/effort", usage: "[low…max]", description: "how hard Claude thinks (default high)" },
+  { name: "/inline", usage: "[mode]", description: "inline maths: auto, image, or unicode" },
+  { name: "/scale", usage: "[0.8–3]", description: "display-math size relative to text (default 1.5)" },
+  { name: "/opacity", usage: "[0.3–1]", description: "window transparency in WezTerm (1 = opaque)" },
+  { name: "/blur", usage: "[on|off]", description: "acrylic blur behind a translucent window" },
+  { name: "/thinking", description: "toggle showing Claude's summarised reasoning" },
+  { name: "/local-exit", usage: "[mode]", description: "what to unload/stop in LM Studio on exit" },
+  { name: "/attach", usage: "<file…>", description: "attach images, PDFs or .tex/.txt files (or @file / drag-drop)", hasArgs: true },
+  { name: "/detach", description: "remove pending attachments" },
+  { name: "/copy", description: "copy the last answer (markdown + LaTeX) to the clipboard" },
+  { name: "/copy-latex", description: "copy just the display equations from the last answer" },
+  { name: "/redraw", description: "re-render the conversation (e.g. after resizing)" },
+  { name: "/clear", description: "start a new conversation" },
+  { name: "/setup-terminal", description: "let mathcli theme its WezTerm window (.wezterm.lua)" },
+  { name: "/key", description: "replace the saved Anthropic API key" },
+  { name: "/help", description: "show commands and keyboard shortcuts" },
+  { name: "/exit", description: "quit (or Ctrl+C on an empty prompt)" },
 ];
+
+const MODEL_DESCRIPTIONS: Record<string, string> = {
+  opus: "Best for hard proofs and multi-step derivations",
+  sonnet: "Fast and strong for everyday maths",
+  fable: "Deepest reasoning for tough challenges",
+  haiku: "Fastest for quick checks and definitions",
+};
+
+const EFFORT_DESCRIPTIONS: Record<Effort, string> = {
+  low: "Fastest, minimal reasoning",
+  medium: "Balanced speed and depth",
+  high: "Default — thorough derivations",
+  xhigh: "Extra reasoning for tricky problems",
+  max: "Maximum reasoning budget",
+};
+
+const INLINE_DESCRIPTIONS: Record<InlineMode, string> = {
+  auto: "Exact Unicode when possible, typeset image otherwise",
+  image: "Always typeset inline maths as one-row images",
+  unicode: "Unicode text only (no inline images)",
+};
+
+const LOCAL_EXIT_DESCRIPTIONS: Record<LocalOnExit, string> = {
+  auto: "Unload models we loaded; stop server / quit LM Studio only if we started them",
+  always: "Unload all models, stop the server and quit LM Studio",
+  keep: "Leave LM Studio and loaded models running (faster to resume)",
+};
+
+function themeSwatch(name: string): string {
+  const d = resolveTheme(name);
+  if (!d) return "";
+  return [d.background, d.panel, d.accent, d.heading, d.inlineMath]
+    .map((h) => `\x1b[48;2;${parseInt(h.slice(1, 3), 16)};${parseInt(h.slice(3, 5), 16)};${parseInt(h.slice(5, 7), 16)}m  `)
+    .join("") + t.reset;
+}
 
 async function command(line: string, convo: Session): Promise<"exit" | void> {
   const [cmd, ...args] = line.slice(1).split(/\s+/);
   const arg = args.join(" ").trim();
+  const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
   switch (cmd.toLowerCase()) {
     case "help": case "?":
-      for (const [c, d] of HELP) out(`  ${t.accent}${c.padEnd(36)}${t.reset}${t.dim}${d}${t.reset}`);
-      note("Enter sends · Ctrl+J or \\ + Enter for a new line · ↑/↓ history · Ctrl+C interrupts an answer");
+      for (const c of COMMANDS) {
+        const label = c.usage ? `${c.name} ${c.usage}` : c.name;
+        out(`  ${t.accent}${label.padEnd(28)}${t.reset}${t.dim}${c.description}${t.reset}`);
+      }
+      note("Type / to autocomplete commands · Enter sends · Ctrl+J or \\ + Enter for newline · ↑/↓ history · Ctrl+C stops");
       break;
     case "attach": case "a": {
       const paths = arg.match(/"[^"]+"|'[^']+'|\S+/g) ?? [];
@@ -223,6 +264,57 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
         cfg = saveConfig({ model: claudeId });
         note(`Model: ${claudeId}${convo.turns.length ? " — the conversation so far carries over" : ""}`);
         if (!convo.claude.hasKey) note("No Anthropic API key yet — add one with /key.");
+        break;
+      }
+      if (!arg && interactive) {
+        process.stdout.write(`  ${t.dim}Checking LM Studio…${t.reset}`);
+        const locals = await localModels(convo);
+        process.stdout.write("\r\x1b[2K");
+        const entries: SelectEntry<string>[] = [{ kind: "header", label: "Claude" }];
+        for (const [alias, id] of Object.entries(MODELS)) {
+          entries.push({
+            value: id,
+            label: `${alias.padEnd(7)} ${id}`,
+            description: MODEL_DESCRIPTIONS[alias],
+            current: id === cfg.model,
+          });
+        }
+        entries.push({ kind: "header", label: "Local (LM Studio)" });
+        if (localError) entries.push({ kind: "note", text: localError });
+        else if (!locals) entries.push({ kind: "note", text: "LM Studio isn't running — start it, or run: lms server start" });
+        else if (!locals.length) entries.push({ kind: "note", text: "no models installed — download one in LM Studio" });
+        for (const m of locals ?? []) {
+          const tags = [m.vision ? "vision" : "", `${tokens(m.contextLength)} ctx`, m.loaded ? "loaded" : ""].filter(Boolean).join(", ");
+          entries.push({
+            value: `local:${m.id}`,
+            label: m.id,
+            description: `${tags}${m.id === cfg.localModel ? " · default local" : ""}`,
+            current: `local:${m.id}` === cfg.model,
+          });
+        }
+        const picked = await select({
+          title: "Select model",
+          subtitle: "Switch mid-conversation — history carries over.",
+          entries,
+          initialValue: cfg.model,
+          step: {
+            values: EFFORTS,
+            index: Math.max(0, EFFORTS.indexOf(cfg.effort)),
+            format: (v) => `${t.bold}${v}${t.reset} ${t.dim}effort · ←/→ to adjust${t.reset}`,
+            activeFor: (item) => !isLocalModel(item.value) && !item.value.startsWith("claude-haiku"),
+          },
+        });
+        if (picked.kind === "cancel") break;
+        const id = picked.value;
+        const nextEffort = (picked.stepValue as Effort | undefined) ?? cfg.effort;
+        const patch: Partial<typeof cfg> = isLocalModel(id)
+          ? { model: id, localModel: localModelId(id) }
+          : { model: id, effort: nextEffort };
+        cfg = saveConfig(patch);
+        const effortNote = !isLocalModel(id) && !id.startsWith("claude-haiku") ? ` (${cfg.effort} effort)` : "";
+        note(`Model: ${id}${effortNote}${convo.turns.length ? " — the conversation so far carries over" : ""}`);
+        if (isLocalModel(id) && !locals?.find((m) => `local:${m.id}` === id)?.loaded) note("It will load on the first message (a few seconds).");
+        if (!isLocalModel(id) && !convo.claude.hasKey) note("No Anthropic API key yet — add one with /key.");
         break;
       }
       const locals = await localModels(convo);
@@ -256,10 +348,23 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
       break;
     }
     case "effort": case "e": {
+      if (!arg && interactive) {
+        const picked = await select<Effort>({
+          title: "Reasoning effort",
+          subtitle: "How deeply Claude thinks before answering (ignored by Haiku and local models).",
+          entries: EFFORTS.map((e) => ({ value: e, label: e, description: EFFORT_DESCRIPTIONS[e], current: e === cfg.effort })),
+          initialValue: cfg.effort,
+        });
+        if (picked.kind === "cancel") break;
+        cfg = saveConfig({ effort: picked.value });
+        note(`Effort: ${picked.value}`);
+        break;
+      }
       if (!arg) { note(`Effort: ${cfg.effort}  (options: ${EFFORTS.join(", ")})`); break; }
-      if (!EFFORTS.includes(arg as Effort)) { error(`effort must be one of ${EFFORTS.join(", ")}`); break; }
-      cfg = saveConfig({ effort: arg as Effort });
-      note(`Effort: ${arg}`);
+      const val = arg.toLowerCase();
+      if (!EFFORTS.includes(val as Effort)) { error(`effort must be one of ${EFFORTS.join(", ")}`); break; }
+      cfg = saveConfig({ effort: val as Effort });
+      note(`Effort: ${val}`);
       break;
     }
     case "thinking":
@@ -267,11 +372,29 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
       note(`Show reasoning: ${cfg.showThinking ? "on" : "off"}`);
       break;
     case "theme": {
+      if (!arg && interactive) {
+        const names = listThemes();
+        const prev = cfg.theme;
+        const picked = await select<string>({
+          title: "Select theme",
+          subtitle: "Live preview — custom themes live in ~/.mathcli/themes/<name>.json.",
+          entries: names.map((name) => ({ value: name, label: name, extra: themeSwatch(name), current: name === cfg.theme })),
+          initialValue: cfg.theme,
+          onHighlight: (item) => { useTheme(item.value); },
+        });
+        if (picked.kind === "cancel") {
+          useTheme(prev);
+          break;
+        }
+        useTheme(picked.value);
+        cfg = saveConfig({ theme: picked.value });
+        redraw(); // repaint earlier boxes and equations in the new colours
+        note(`Theme: ${picked.value}`);
+        break;
+      }
       if (!arg) {
         for (const name of listThemes()) {
-          const d = resolveTheme(name)!;
-          const swatch = [d.background, d.panel, d.accent, d.heading, d.inlineMath].map((h) => `\x1b[48;2;${parseInt(h.slice(1, 3), 16)};${parseInt(h.slice(3, 5), 16)};${parseInt(h.slice(5, 7), 16)}m  `).join("") + t.reset;
-          out(`  ${name === cfg.theme ? t.accent + "›" : " "} ${name.padEnd(10)}${t.reset}${swatch}`);
+          out(`  ${name === cfg.theme ? t.accent + "›" : " "} ${name.padEnd(10)}${t.reset}${themeSwatch(name)}`);
         }
         note("Custom themes: ~/.mathcli/themes/<name>.json with any colour fields and an optional \"base\".");
         break;
@@ -283,6 +406,31 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
       break;
     }
     case "opacity": {
+      if (!arg && interactive) {
+        const presets = [...new Set([1, 0.95, 0.9, 0.85, 0.8, 0.7, 0.6, 0.5, cfg.opacity])].sort((a, b) => b - a);
+        const prev = cfg.opacity;
+        const picked = await select<number>({
+          title: "Window opacity",
+          subtitle: "Live preview in WezTerm (requires /setup-terminal).",
+          entries: presets.map((n) => ({
+            value: n,
+            label: n.toFixed(2),
+            description: n === 1 ? "opaque" : n >= 0.85 ? "subtle translucency" : "glass",
+            current: Math.abs(n - cfg.opacity) < 1e-6,
+          })),
+          initialValue: cfg.opacity,
+          onHighlight: (item) => { sendTerminalTheme(t.def, item.value, cfg.blur); },
+        });
+        if (picked.kind === "cancel") {
+          sendTerminalTheme(t.def, prev, cfg.blur);
+          break;
+        }
+        cfg = saveConfig({ opacity: picked.value });
+        sendTerminalTheme(t.def, cfg.opacity, cfg.blur);
+        note(`Opacity: ${picked.value}${picked.value < 1 && cfg.blur ? " with acrylic blur" : ""}`);
+        if (bridgeStatus() !== "enabled") note("Run /setup-terminal first so WezTerm applies it.");
+        break;
+      }
       if (!arg) { note(`Opacity: ${cfg.opacity}`); break; }
       const n = Number(arg);
       if (!(n >= 0.3 && n <= 1)) { error("opacity must be between 0.3 and 1"); break; }
@@ -293,7 +441,30 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
       break;
     }
     case "blur": {
-      const on = arg ? arg === "on" : !cfg.blur;
+      if (!arg && interactive) {
+        const prev = cfg.blur;
+        const picked = await select<boolean>({
+          title: "Acrylic blur",
+          subtitle: "Windows 11 frosted backdrop behind translucent windows (/opacity < 1).",
+          entries: [
+            { value: true, label: "on", description: "enable acrylic blur", current: cfg.blur },
+            { value: false, label: "off", description: "clear transparency only", current: !cfg.blur },
+          ],
+          initialValue: cfg.blur,
+          onHighlight: (item) => { sendTerminalTheme(t.def, cfg.opacity, item.value); },
+        });
+        if (picked.kind === "cancel") {
+          sendTerminalTheme(t.def, cfg.opacity, prev);
+          break;
+        }
+        cfg = saveConfig({ blur: picked.value });
+        sendTerminalTheme(t.def, cfg.opacity, cfg.blur);
+        note(`Blur: ${cfg.blur ? "on" : "off"}${cfg.opacity >= 1 ? " (takes effect when /opacity is below 1)" : ""}`);
+        break;
+      }
+      const val = arg.toLowerCase();
+      if (arg && val !== "on" && val !== "off") { error("blur must be on or off"); break; }
+      const on = arg ? val === "on" : !cfg.blur;
       cfg = saveConfig({ blur: on });
       sendTerminalTheme(t.def, cfg.opacity, cfg.blur);
       note(`Blur: ${on ? "on" : "off"}${cfg.opacity >= 1 ? " (takes effect when /opacity is below 1)" : ""}`);
@@ -306,26 +477,68 @@ async function command(line: string, convo: Session): Promise<"exit" | void> {
       sendTerminalTheme(t.def, cfg.opacity, cfg.blur);
       break;
     case "local-exit": {
-      const explain: Record<LocalOnExit, string> = {
-        auto: "unload models this session loaded; stop the server and quit LM Studio if mathcli started them",
-        always: "unload all models, stop the server and quit LM Studio",
-        keep: "leave LM Studio and loaded models as they are",
-      };
-      if (!arg) { note(`On exit: ${cfg.localOnExit} — ${explain[cfg.localOnExit]}  (options: ${LOCAL_ON_EXIT.join(", ")})`); break; }
-      if (!LOCAL_ON_EXIT.includes(arg as LocalOnExit)) { error(`must be one of ${LOCAL_ON_EXIT.join(", ")}`); break; }
-      cfg = saveConfig({ localOnExit: arg as LocalOnExit });
-      note(`On exit: ${arg} — ${explain[arg as LocalOnExit]}`);
+      if (!arg && interactive) {
+        const picked = await select<LocalOnExit>({
+          title: "Local model exit behaviour",
+          subtitle: "What Math CLI frees in LM Studio when you quit or close the window.",
+          entries: LOCAL_ON_EXIT.map((m) => ({ value: m, label: m, description: LOCAL_EXIT_DESCRIPTIONS[m], current: m === cfg.localOnExit })),
+          initialValue: cfg.localOnExit,
+        });
+        if (picked.kind === "cancel") break;
+        cfg = saveConfig({ localOnExit: picked.value });
+        note(`On exit: ${picked.value} — ${LOCAL_EXIT_DESCRIPTIONS[picked.value]}`);
+        break;
+      }
+      if (!arg) { note(`On exit: ${cfg.localOnExit} — ${LOCAL_EXIT_DESCRIPTIONS[cfg.localOnExit]}  (options: ${LOCAL_ON_EXIT.join(", ")})`); break; }
+      const val = arg.toLowerCase();
+      if (!LOCAL_ON_EXIT.includes(val as LocalOnExit)) { error(`must be one of ${LOCAL_ON_EXIT.join(", ")}`); break; }
+      cfg = saveConfig({ localOnExit: val as LocalOnExit });
+      note(`On exit: ${val} — ${LOCAL_EXIT_DESCRIPTIONS[val as LocalOnExit]}`);
       break;
     }
     case "inline": {
+      if (!arg && interactive) {
+        const picked = await select<InlineMode>({
+          title: "Inline maths rendering",
+          subtitle: "Controls how $…$ inside lines of prose is rendered.",
+          entries: INLINE_MODES.map((m) => ({ value: m, label: m, description: INLINE_DESCRIPTIONS[m], current: m === cfg.inlineMath })),
+          initialValue: cfg.inlineMath,
+        });
+        if (picked.kind === "cancel") break;
+        cfg = saveConfig({ inlineMath: picked.value });
+        redraw();
+        note(`Inline maths: ${picked.value}`);
+        break;
+      }
       if (!arg) { note(`Inline maths: ${cfg.inlineMath}  (options: ${INLINE_MODES.join(", ")})`); break; }
-      if (!INLINE_MODES.includes(arg as InlineMode)) { error(`inline mode must be one of ${INLINE_MODES.join(", ")}`); break; }
-      cfg = saveConfig({ inlineMath: arg as InlineMode });
+      const val = arg.toLowerCase();
+      if (!INLINE_MODES.includes(val as InlineMode)) { error(`inline mode must be one of ${INLINE_MODES.join(", ")}`); break; }
+      cfg = saveConfig({ inlineMath: val as InlineMode });
       redraw();
-      note(`Inline maths: ${arg}`);
+      note(`Inline maths: ${val}`);
       break;
     }
     case "scale": {
+      if (!arg && interactive) {
+        const presets = [...new Set([1.0, 1.2, 1.4, 1.5, 1.7, 2.0, 2.5, cfg.mathScale])].sort((a, b) => a - b);
+        const picked = await select<number>({
+          title: "Display-math scale",
+          subtitle: "Equation size relative to your terminal font (or run /scale <0.8–3>).",
+          entries: presets.map((n) => ({
+            value: n,
+            label: `${n.toFixed(1)}×`,
+            description: n === 1.5 ? "default" : n <= 1.2 ? "compact" : n >= 2.0 ? "large" : undefined,
+            current: Math.abs(n - cfg.mathScale) < 1e-6,
+          })),
+          initialValue: cfg.mathScale,
+        });
+        if (picked.kind === "cancel") break;
+        cfg = saveConfig({ mathScale: picked.value });
+        redraw();
+        note(`Display-math scale: ${picked.value}`);
+        break;
+      }
+      if (!arg) { note(`Display-math scale: ${cfg.mathScale}  (0.8–3)`); break; }
       const n = Number(arg);
       if (!(n >= 0.8 && n <= 3)) { error("scale must be between 0.8 and 3"); break; }
       cfg = saveConfig({ mathScale: n });
@@ -530,8 +743,9 @@ for (;;) {
   const r = await prompt({
     status: () => status(convo),
     above: attachmentChips,
-    placeholder: convo.turns.length ? "Follow up…" : "Ask a maths question, or attach a problem sheet with @file",
+    placeholder: convo.turns.length ? "Follow up…" : "Ask a maths question, type / for commands, or attach with @file",
     history,
+    commands: COMMANDS,
     onPaste,
   });
   if (r.kind === "exit") break;
