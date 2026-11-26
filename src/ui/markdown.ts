@@ -40,6 +40,7 @@ export class StreamRenderer {
   private heldLines = 0;
   private started = false;
   private lastBlank = true;
+  private lastSafe = ""; // safe prefix (and width) streamPartial last laid out; unchanged = nothing new to print
   readonly displayMath: string[] = []; // every display equation in this answer, for /copy
 
   constructor(private o: RendererOptions) {}
@@ -79,6 +80,7 @@ export class StreamRenderer {
   }
 
   end() {
+    this.lastSafe = "";
     if (this.buf) this.handleLine(this.buf);
     if (this.held) {
       const h = this.held;
@@ -94,6 +96,7 @@ export class StreamRenderer {
   // ---- line handling -------------------------------------------------------------------------
 
   private handleLine(line: string) {
+    this.lastSafe = "";
     if (this.mode === "code") {
       if (/^\s*```/.test(line)) {
         this.mode = "text";
@@ -167,6 +170,7 @@ export class StreamRenderer {
   }
 
   private finishLine(line: string) {
+    this.lastSafe = "";
     const block = formatBlock(line, this.inlineMath);
     if (!block) {
       this.emitted = 0;
@@ -185,6 +189,10 @@ export class StreamRenderer {
     if (!partial ||/^\s*(```|\$\$|\\\[|\||#)/.test(partial)) return;
     const safe = safePrefix(partial);
     if (!safe) return;
+    // Most deltas don't reach a new word boundary: skip re-formatting and re-wrapping the paragraph.
+    const key = this.o.width() + "\0" + safe;
+    if (key === this.lastSafe) return;
+    this.lastSafe = key;
     const block = formatBlock(safe, this.inlineMath);
     if (!block || !block.wrap) return;
     const lines = this.layout(block);
@@ -346,34 +354,48 @@ function inline(s: string, math: (tex: string) => string): string {
 function wrapStyled(s: string, firstWidth: number, restWidth: number): string[] {
   const words = s.split(" ");
   const lines: string[] = [];
-  let line = "";
+  const style = new SgrState();
+  let line = "", len = 0; // len = visibleLen(line)
   let width = firstWidth;
   for (const word of words) {
-    const len = visibleLen(line), wl = visibleLen(word);
+    const wl = visibleLen(word);
     if (line && len + 1 + wl > width) {
       lines.push(line);
-      line = activeStyle(lines.join(" ")) + word;
+      line = style.escape() + word; // re-open the styling in effect at the break
+      len = wl;
       width = restWidth;
+    } else if (line) {
+      line += " " + word;
+      len += 1 + wl;
     } else {
-      line += (line ? " " : "") + word;
+      line = word;
+      len = wl;
     }
+    style.update(word);
   }
   lines.push(line);
   return lines.map((l) => l + t.reset);
 }
 
-// The SGR state in effect at the end of `s` (bold / italic / foreground colour), as an escape string.
-function activeStyle(s: string): string {
-  let bold = false, italic = false, color = "";
-  for (const m of s.matchAll(/\x1b\[([\d;]*)m/g)) {
-    const p = m[1];
-    if (p === "0" || p === "") { bold = italic = false; color = ""; }
-    else if (p === "1") bold = true;
-    else if (p === "22") bold = false;
-    else if (p === "3") italic = true;
-    else if (p === "23") italic = false;
-    else if (p.startsWith("38;")) color = m[0];
-    else if (p === "39") color = "";
+// SGR state (bold / italic / foreground colour) tracked incrementally as text is appended.
+class SgrState {
+  private bold = false;
+  private italic = false;
+  private color = "";
+  update(s: string) {
+    if (!s.includes("\x1b")) return;
+    for (const m of s.matchAll(/\x1b\[([\d;]*)m/g)) {
+      const p = m[1];
+      if (p === "0" || p === "") { this.bold = this.italic = false; this.color = ""; }
+      else if (p === "1") this.bold = true;
+      else if (p === "22") this.bold = false;
+      else if (p === "3") this.italic = true;
+      else if (p === "23") this.italic = false;
+      else if (p.startsWith("38;")) this.color = m[0];
+      else if (p === "39") this.color = "";
+    }
   }
-  return (bold ? t.bold : "") + (italic ? t.italic : "") + color;
+  escape(): string {
+    return (this.bold ? t.bold : "") + (this.italic ? t.italic : "") + this.color;
+  }
 }

@@ -33,3 +33,9 @@ export function expandLine(line: string): string {
     return `${img.esc}\x1b[${col + img.cols + 1}G`;
   });
 }
+
+// Forget every inline image (e.g. on /clear). Only call between answers: placeholders already handed out become invalid.
+export function clearImagePlaceholders(): void {
+  images.length = 0;
+  ids.clear();
+}
